@@ -208,7 +208,7 @@ class Config:
         self.reset_every = int(self.reset_every * factor)
         self.refine_every = int(self.refine_every * factor)
 
-
+# 定义参数并绑定优化器
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
@@ -239,7 +239,8 @@ def create_splats_with_optimizers(
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
     quats = torch.rand((N, 4))  # [N, 4]
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
-
+    
+    # 将 numpy 数组转为 PyTorch 张量，并用 nn.Parameter 包裹，意味着“这个变量是需要被梯度优化的”
     params = [
         # name, value, lr
         ("means", torch.nn.Parameter(points), 1.6e-4 * scene_scale),
@@ -266,6 +267,7 @@ def create_splats_with_optimizers(
     # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
     # Note that this would not make the training exactly equivalent, see
     # https://arxiv.org/pdf/2402.18824v1
+    # 这里定义了优化器
     optimizers = {
         name: (torch.optim.SparseAdam if sparse_grad else torch.optim.Adam)(
             [{"params": splats[name], "lr": lr * math.sqrt(batch_size)}],
@@ -551,13 +553,13 @@ class Runner:
                     time.sleep(0.01)
                 self.viewer.lock.acquire()
                 tic = time.time()
-
+            # ！！！获取数据部分！！！
             try:
                 data = next(trainloader_iter)
             except StopIteration:
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
-
+            # ！！！将数据挪到 GPU 上！！！
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
@@ -581,6 +583,7 @@ class Runner:
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward
+            # ！！！将当前视角的相机参数传进去，渲染出 2D 图像 (colors)！！！
             (
                 renders,
                 alphas,
@@ -624,8 +627,11 @@ class Runner:
                 colors = colors * masks[..., None]
 
             # loss
+            # ！！！计算渲染图和真实图 (pixels) 之间的 L1 差异和 SSIM 差异！！！
             l1loss = l1_loss(colors, pixels).mean()
             ssimloss = ssim_loss(colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2))
+            
+            # ！！！线性插值组合 loss！！！
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
                 # query depths from depth map
@@ -669,7 +675,7 @@ class Runner:
                     curr_dist_lambda = 0.0
                 distloss = render_distort.mean()
                 loss += distloss * curr_dist_lambda
-
+            # ！！！反向传播 1. 自动计算所有参数的梯度！！！
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
@@ -733,6 +739,8 @@ class Runner:
                     )
 
             # optimize
+            # ！！！反向传播 2. 根据梯度，更新所有高斯球的参数！！！
+            # ！！！反向传播 3. 清空这一轮的梯度，防止与下一轮累加！！！
             for optimizer in self.optimizers.values():
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)

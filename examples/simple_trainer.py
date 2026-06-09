@@ -278,7 +278,7 @@ class Config:
         else:
             assert_never(strategy)
 
-
+# 定义参数并绑定优化器
 def create_splats_with_optimizers(
     parser: Parser,
     init_type: str = "sfm",
@@ -324,7 +324,8 @@ def create_splats_with_optimizers(
     N = points.shape[0]
     quats = torch.rand((N, 4))  # [N, 4]
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
-
+    
+    # 将 numpy 数组转为 PyTorch 张量，并用 nn.Parameter 包裹，意味着“这个变量是需要被梯度优化的”
     params = [
         # name, value, lr
         ("means", torch.nn.Parameter(points), means_lr * scene_scale),
@@ -359,6 +360,7 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
+    # 定义优化器
     optimizers = {
         name: optimizer_class(
             [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
@@ -791,19 +793,28 @@ class Runner:
         world_size = self.world_size
 
         # Dump cfg.
+        # 这里涉及到 DDP 
+        # 在多显卡并行训练时，PyTorch 会启动 N 个完全相同的进程。
+        # world_rank 就是进程的身份证号，主卡是 0，其余是 1, 2, 3。
         if world_rank == 0:
             with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
                 yaml.dump(vars(cfg), f)
 
         max_steps = cfg.max_steps
         init_step = 0
-
+        
+        # 学习率调度器 schedulers
+        # ExponentialLR 衰减方式调整学习率
+        # ChainedScheduler 组合方式调整学习率
+        # LinearLR 线性方式调整学习率
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
                 self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
             ),
         ]
+        
+        # 发现这里还可以在训练的过程中优化相机位姿
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
             schedulers.append(
@@ -811,6 +822,8 @@ class Runner:
                     self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                 )
             )
+            
+        # 后处理阶段有自己的优化方式
         # Post-processing module has a learning rate schedule
         if cfg.post_processing == "bilateral_grid":
             # Linear warmup + exponential decay
@@ -835,7 +848,8 @@ class Runner:
                 max_optimization_iters=max_steps,
             )
             schedulers.extend(ppisp_schedulers)
-
+        # 到 dataloader 开始干活了
+        # pin_memory 表示锁页内存 - 使 PCIe 带宽翻倍
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
             batch_size=cfg.batch_size,
@@ -853,6 +867,7 @@ class Runner:
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
+                # 加入线程锁 
                 self.viewer.lock.acquire()
                 tic = time.time()
 
@@ -864,13 +879,18 @@ class Runner:
                 and step >= cfg.ppisp_controller_activation_num_steps
             ):
                 self.freeze_gaussians()
-
+                
+            
+            # ！！！获取数据部分！！！
             try:
                 data = next(trainloader_iter)
             except StopIteration:
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
-
+            
+            
+            # ！！！将数据挪到 GPU 上！！！
+            # dataloader -> data 传递的是字典
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
@@ -878,16 +898,19 @@ class Runner:
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
+            # 从这里可以看出 gsplat 拥有掩码功能
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
             exposure = (
                 data["exposure"].to(device) if "exposure" in data else None
             )  # [B,]
+            # 这里可以选择是否开启 深度损失 的计算
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
 
             height, width = pixels.shape[1:3]
-
+            
+            # 可以选择是否开启 相机位姿扰动与优化调整
             if cfg.pose_noise:
                 camtoworlds = self.pose_perturb(camtoworlds, image_ids)
 
@@ -895,6 +918,7 @@ class Runner:
                 camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
             # sh schedule
+            # 通过 step // cfg.sh_degree_interval 的方式控制球谐函数在不同的 step 选择不同的 degree
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward
@@ -904,25 +928,30 @@ class Runner:
                 Ks=Ks,
                 width=width,
                 height=height,
+                
                 sh_degree=sh_degree_to_use,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
+                
                 masks=masks,
                 frame_idcs=image_ids,
-                camera_idcs=data["camera_idx"].to(device),
+                camera_idcs=data["camera_idx"].to(device), # 相机索引,用于多摄系统
                 exposure=exposure,
             )
             if renders.shape[-1] == 4:
+                # 进行切片操作, 只对第四个维度进行切片
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
                 colors, depths = renders, None
-
+            
+            # 使用 random_background 逼迫优化器把高斯球的透明度推向极端
+            # 属于一种正则化技巧
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
-
+            # 为后续 自适应密度控制 增删改查 做准备
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -932,6 +961,7 @@ class Runner:
             )
 
             # loss
+            # ！！！计算渲染图和真实图 (pixels) 之间的 L1 差异和 SSIM 差异！！！
             if masks is not None:
                 # Exclude masked pixels (e.g. ego vehicle) from L1.
                 # For SSIM (patch-based), zero out both sides at masked locations
@@ -946,6 +976,8 @@ class Runner:
             ssimloss = ssim_loss(
                 colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
             )
+            
+            # ！！！线性插值组合 loss！！！
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
                 # query depths from depth map
@@ -983,6 +1015,8 @@ class Runner:
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * scale_reg_loss(self.splats["scales"])
 
+
+            # ！！！反向传播 1. 自动计算所有参数的梯度！！！
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| sh degree={sh_degree_to_use}| "
