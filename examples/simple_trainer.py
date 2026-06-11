@@ -962,25 +962,33 @@ class Runner:
 
             # loss
             # ！！！计算渲染图和真实图 (pixels) 之间的 L1 差异和 SSIM 差异！！！
+            # 两种损失处理方式不同
             if masks is not None:
                 # Exclude masked pixels (e.g. ego vehicle) from L1.
                 # For SSIM (patch-based), zero out both sides at masked locations
                 # so masked patches don't pull colors toward an arbitrary value.
+                # L1 Loss 是一个点对点（Pixel-wise）的损失
+                # 将图像直接拉成了一个 [n, 3] 的一维向量
                 l1loss = l1_loss(colors[masks], pixels[masks]).mean()
+                # SSIM Loss 由于用到卷积处理，所以不能直接置零
+                # 乘0处理
                 colors_ssim = colors * masks[..., None]
                 pixels_ssim = pixels * masks[..., None]
             else:
                 l1loss = l1_loss(colors, pixels).mean()
                 colors_ssim = colors
                 pixels_ssim = pixels
+            # 变换 HWC [Batch, Height, Width, Channels] 为 CHW  [Batch, Channels, Height, Width]
             ssimloss = ssim_loss(
                 colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
             )
             
             # ！！！线性插值组合 loss！！！
+            # lerp : linear interpolation 线性插值函数
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.depth_loss:
                 # query depths from depth map
+                # 为了配合空间采样器，对坐标进行变换
                 points = torch.stack(
                     [
                         points[:, :, 0] / (width - 1) * 2 - 1,
@@ -988,16 +996,20 @@ class Runner:
                     ],
                     dim=-1,
                 )  # normalize to [-1, 1]
+                
+                # 用双线性插值（Bilinear Interpolation）计算点的深度
                 grid = points.unsqueeze(2)  # [1, M, 1, 2]
                 depths = F.grid_sample(
                     depths.permute(0, 3, 1, 2), grid, align_corners=True
                 )  # [1, 1, M, 1]
+                
                 depths = depths.squeeze(3).squeeze(1)  # [1, M]
                 # calculate loss in disparity space
                 depthloss = depth_l1_loss(
                     depths, depths_gt, scene_scale=self.scene_scale
                 )
                 loss += depthloss * cfg.depth_lambda
+            
             if cfg.post_processing == "bilateral_grid":
                 post_processing_reg_loss = 10 * total_variation_loss(
                     self.post_processing_module.grids
@@ -1026,6 +1038,7 @@ class Runner:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
                 desc += f"pose err={pose_err.item():.6f}| "
+            # 刷新终端
             pbar.set_description(desc)
 
             # write images (gt and render)
@@ -1036,7 +1049,8 @@ class Runner:
             #         f"{self.render_dir}/train_rank{self.world_rank}.png",
             #         (canvas * 255).astype(np.uint8),
             #     )
-
+            
+            # 下面是 tensorboard 的常用操作
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
                 self.writer.add_scalar("train/loss", loss.item(), step)
@@ -1053,6 +1067,8 @@ class Runner:
                         step,
                     )
                 if cfg.tb_save_image:
+                    # .detach -> .cpu -> .numpy 一系列常用操作 
+                    # 将图片从 GPU 搬运到 CPU 上
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
                     self.writer.add_image("train/render", canvas, step)
@@ -1072,12 +1088,16 @@ class Runner:
                     "w",
                 ) as f:
                     json.dump(stats, f)
+                    
+                # 不选择 torch.save(model)
+                # 而是使用 state_dict() 的方式存储权重
                 data = {
                     "step": step,
                     "scene_id": self.scene.id,
                     "splats": self.splats.state_dict(),
                 }
                 if cfg.pose_opt:
+                    # 如果是多卡训练 需在存模型前将 module 前缀去除
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
                     else:
@@ -1089,22 +1109,32 @@ class Runner:
                         data["app_module"] = self.app_module.state_dict()
                 if self.post_processing_module is not None:
                     data["post_processing"] = self.post_processing_module.state_dict()
+                # 写好 大data后 再将其存入 pt 文件中
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
+                
+            # 导出 .ply 模型
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
+                # 开启 外观优化 appearance optimization 后
+                # 场景的颜色不仅由高斯球本身的球谐函数（SH）决定
+                # 还叠加了一个额外的神经网络（app_module）
+                # 需要使用图形学中的 烘焙 Baking
                 if self.cfg.app_opt:
                     # eval at origin to bake the appeareance into the colors
+                    # 1. 模拟一个位于原点的虚拟相机，没有任何视角偏移 (dirs=0)
                     rgb = self.app_module(
                         features=self.splats["features"],
                         embed_ids=None,
                         dirs=torch.zeros_like(self.splats["means"][None, :, :]),
                         sh_degree=sh_degree_to_use,
                     )
+                    # 2. 把神经网络算出来的补偿颜色，硬生生加回基础颜色里
                     rgb = rgb + self.splats["colors"]
                     rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
+                    # 3. 把这固定的 RGB 颜色转回 0 阶的球谐系数 (sh0)
                     sh0 = rgb_to_sh(rgb)
                     shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
                 else:
@@ -1127,6 +1157,7 @@ class Runner:
                 )
 
             # Turn Gradients into Sparse Tensor before running optimizer
+            # 在命令行中输入的 --pack 就是在这里显现作用
             if cfg.sparse_grad:
                 assert cfg.packed, "Sparse gradients only work with packed mode."
                 gaussian_ids = info["gaussian_ids"]
@@ -1134,13 +1165,17 @@ class Runner:
                     grad = self.splats[k].grad
                     if grad is None or grad.is_sparse:
                         continue
+                    # 使用 sparse_coo_tensor 将稀疏矩阵转化为 坐标本 和 数值本
                     self.splats[k].grad = torch.sparse_coo_tensor(
+                        # 坐标本 indices 告诉 pytorch 哪些位置有值
                         indices=gaussian_ids[None],  # [1, nnz]
+                        # 数值本 values 
                         values=grad[gaussian_ids],  # [nnz, ...]
                         size=self.splats[k].size(),  # [N, ...]
                         is_coalesced=len(Ks) == 1,
                     )
-
+            # 可见性感知 adam 优化器
+            # Taming 3DGS
             if cfg.visible_adam:
                 gaussian_cnt = self.splats.means.shape[0]
                 if cfg.packed:
@@ -1153,10 +1188,14 @@ class Runner:
 
             # optimize
             for optimizer in self.optimizers.values():
+                # ！！！反向传播 2. 根据梯度，更新所有高斯球的参数！！！
                 if cfg.visible_adam:
                     optimizer.step(visibility_mask)
                 else:
                     optimizer.step()
+                # ！！！反向传播 3. 清空这一轮的梯度，防止与下一轮累加！！！
+                # 不同于 optimizer.zero_grad()
+                # 加上 set_to_none=True 后，PyTorch 会直接把梯度矩阵在显存中彻底销毁
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.pose_optimizers:
                 optimizer.step()
@@ -1171,6 +1210,10 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
+            # 自适应密度控制 step_post_backward 
+            # 通过检查 均值梯度 means.grad 若其大于某一阈值
+            # 说明其没能很好地拟合真实场景 进行 clone 或 split 或 prune
+            # prune : 将opacity < 0.05 的椭球剪枝
             if isinstance(self.cfg.strategy, DefaultStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
@@ -1202,7 +1245,8 @@ class Runner:
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
                 self.run_compression(step=step)
-
+            
+            # 对应前面 self.viewer.lock.acquire() 释放线程锁
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
                 num_train_steps_per_sec = 1.0 / (max(time.time() - tic, 1e-10))
